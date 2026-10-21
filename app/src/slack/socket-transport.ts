@@ -20,28 +20,17 @@ import type {
 } from "./transport.js";
 
 /**
- * No frame from Slack for this long means the socket is probably half-open.
+ * Socket continuously not OPEN for this long means Bolt's own reconnect is
+ * wedged (2026-08-18: zero TCP sockets to Slack for most of an hour).
  *
- * Slack pings roughly every 30s on an idle connection, so silence this long is
- * genuine. It is only a valid signal because every frame refreshes the clock:
- * counting handled interactions alone made a quiet workspace look dead, and the
- * watchdog then recycled a healthy socket every couple of minutes. Each of those
- * teardowns lost in-flight acks, which Slack shows as "We had some trouble
- * connecting" before redelivering the interaction with its now-spent trigger_id.
+ * Recovery is a process restart, not an in-process stop()+start(): that raced
+ * Bolt's pending reconnect timers, so each recycle could leave another socket
+ * and reconnect loop alive. On 2026-10-21 that had piled up ~60 sockets,
+ * rate-limited apps.connections.open, and acks failed with "client is not
+ * ready". Transient reconnects and half-open sockets are Bolt's job — its
+ * ping/pong monitor drops a dead socket within seconds.
  */
-const IDLE_TEARDOWN_MS = 90_000;
-
-/**
- * Bound on one recycle attempt (stop + start).
- *
- * Without this, a hung `app.start()` — seen live as a promise that never
- * settled, alongside "recycle failed: undefined" from something rejecting
- * with no reason at all — leaves `#recycling` stuck `true` forever, since its
- * `finally` never runs. Every later watchdog tick then no-ops on the guard,
- * silently disabling recovery for good. A timeout forces the attempt to fail
- * fast so the next tick gets a real try.
- */
-const RECYCLE_TIMEOUT_MS = 20_000;
+const WEDGED_MS = 180_000;
 
 type AnyRecord = Record<string, unknown>;
 
@@ -57,19 +46,22 @@ export class SocketModeTransport implements SlackTransport {
   #connected = false;
   #lastFrameAt: number | null = null;
   #watchdog: NodeJS.Timeout | null = null;
-  /** Guards against the idle check and the readyState check both firing a recycle at once. */
-  #recycling = false;
+  /** When the socket was first seen not OPEN; null while healthy. */
+  #unhealthySince: number | null = null;
   #connectionHandlers: ((connected: boolean) => void)[] = [];
   /** trigger_ids already handled, to drop Slack's redeliveries. */
   #deliveries = new DeliveryLedger();
 
   #log: (line: string) => void;
+  #onWedged: () => void;
 
   constructor(
     private readonly config: InstanceConfig,
     log: (line: string) => void = () => undefined,
+    onWedged: () => void = () => undefined,
   ) {
     this.#log = log;
+    this.#onWedged = onWedged;
     const logger = this.#boltLogger();
     // Built here rather than via `socketMode: true` so the socket client stays
     // reachable: App.receiver is private, and the idle watchdog needs to see
@@ -99,13 +91,18 @@ export class SocketModeTransport implements SlackTransport {
     // trail instead of the total silence we saw on 2026-08-18: the daemon held
     // zero TCP connections to Slack for the better part of an hour with no
     // disconnect, no ping/pong warning, and no watchdog line at all.
-    this.#receiver.client.on("disconnected", () =>
-      this.#log("slack: client state -> disconnected"),
-    );
-    this.#receiver.client.on("reconnecting", () =>
-      this.#log("slack: client state -> reconnecting"),
-    );
-    this.#receiver.client.on("connected", () => this.#log("slack: client state -> connected"));
+    this.#receiver.client.on("disconnected", () => {
+      this.#log("slack: client state -> disconnected");
+      this.#setConnected(false);
+    });
+    this.#receiver.client.on("reconnecting", () => {
+      this.#log("slack: client state -> reconnecting");
+      this.#setConnected(false);
+    });
+    this.#receiver.client.on("connected", () => {
+      this.#log("slack: client state -> connected");
+      this.#setConnected(true);
+    });
   }
 
   /** Forward Bolt's own warn/error into daemon.log; the daemon has no stderr. */
@@ -140,24 +137,24 @@ export class SocketModeTransport implements SlackTransport {
   }
 
   /**
-   * Two independent checks, because 2026-08-18 showed the idle-frame heuristic
-   * alone is not enough: the daemon sat "connected" with zero TCP sockets open
-   * to Slack for the better part of an hour, and the client's own ping/pong
-   * timers never fired to say so either. `isActive()` reads the underlying
-   * WebSocket's actual readyState directly — no network round trip, and it
-   * catches a socket the client itself has lost track of.
+   * `isActive()` reads the WebSocket's real readyState, so it also catches a
+   * socket the client itself has lost track of. A not-OPEN socket is normal
+   * while Bolt reconnects; only a long unbroken stretch counts as wedged.
    */
   #checkHealth(): void {
-    if (this.#recycling) return;
-    const active = this.#receiver.client.websocket?.isActive() ?? false;
-    if (this.#connected && !active) {
-      this.#log("slack: websocket reports inactive while still marked connected, recycling socket");
-      void this.#recycle();
+    if (this.#receiver.client.websocket?.isActive()) {
+      this.#unhealthySince = null;
       return;
     }
-    if (this.idleMs !== null && this.idleMs > IDLE_TEARDOWN_MS) {
-      this.#log(`slack: no frame for ${Math.round((this.idleMs ?? 0) / 1000)}s, recycling socket`);
-      void this.#recycle();
+    this.#setConnected(false);
+    const now = Date.now();
+    this.#unhealthySince ??= now;
+    if (now - this.#unhealthySince > WEDGED_MS) {
+      this.#log(
+        `slack: socket not open for ${Math.round((now - this.#unhealthySince) / 1000)}s, restarting daemon`,
+      );
+      this.#unhealthySince = null;
+      this.#onWedged();
     }
   }
 
@@ -367,37 +364,4 @@ export class SocketModeTransport implements SlackTransport {
     if (connected) this.#lastFrameAt = Date.now();
     for (const handler of this.#connectionHandlers) handler(connected);
   }
-
-  /* v8 ignore start -- needs a live socket to exercise */
-  async #recycle(): Promise<void> {
-    if (this.#recycling) return;
-    this.#recycling = true;
-    this.#setConnected(false);
-    let timer: NodeJS.Timeout | undefined;
-    try {
-      const timeout = new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error("recycle timed out")), RECYCLE_TIMEOUT_MS);
-        timer.unref?.();
-      });
-      await Promise.race([
-        (async () => {
-          await this.#app.stop();
-          await this.#app.start();
-        })(),
-        timeout,
-      ]);
-      this.#setConnected(true);
-    } catch (error) {
-      // Bolt retries on its own; the next watchdog tick tries again. Logged
-      // rather than swallowed — a silent failure here looks identical to a
-      // healthy reconnect until buttons stop working.
-      this.#log(
-        `slack: recycle failed, still disconnected: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    } finally {
-      if (timer) clearTimeout(timer);
-      this.#recycling = false;
-    }
-  }
-  /* v8 ignore stop */
 }

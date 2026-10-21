@@ -178,7 +178,15 @@ any problems below are what a real start would refuse on — this run continues 
         process.stdout.write(`${formatWrite(write)}\n`);
       })
     : role === "primary"
-      ? new SocketModeTransport(config, (line) => log.event("surface", { msg: line }))
+      ? new SocketModeTransport(
+          config,
+          (line) => log.event("surface", { msg: line }),
+          // Non-zero so the service manager restarts into a clean process.
+          () => {
+            log.error("daemon.restart_for_wedged_socket");
+            process.exit(1);
+          },
+        )
       : new WebApiTransport(config);
 
   const surfaces = new Surfaces({
